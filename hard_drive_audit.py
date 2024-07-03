@@ -1,4 +1,7 @@
 import curses
+import pyperclip
+import dataclasses
+from typing import List, Optional
 import win32com.client
 import win32api
 import win32con
@@ -6,81 +9,53 @@ import win32file
 import winioctlcon
 import struct
 import uuid
+from functools import lru_cache
 
-def get_wmi_service():
-    return win32com.client.Dispatch("WbemScripting.SWbemLocator").ConnectServer(".", "root\\cimv2")
 
-def get_physical_drives():
-    wmi_service = get_wmi_service()
-    disk_drives = wmi_service.ExecQuery("SELECT * FROM Win32_DiskDrive")
-    return [{
-        'DeviceID': disk.DeviceID,
-        'Model': disk.Model,
-        'SerialNumber': disk.SerialNumber,
-        'Index': disk.Index
-    } for disk in disk_drives]
+@dataclasses.dataclass
+class Volume:
+    drive_letter: str
+    file_system: str
+    capacity: int
+    free_space: int
+    label: str
+    bitlocker_status: str
 
-def get_volume_info(partition_device_id):
-    wmi_service = win32com.client.Dispatch("WbemScripting.SWbemLocator").ConnectServer(".", "root\\cimv2")
-    volumes = wmi_service.ExecQuery(f"SELECT * FROM Win32_Volume WHERE DeviceID='{partition_device_id}'")
 
-    for volume in volumes:
-        return {
-            'FileSystem': volume.FileSystem or 'N/A',
-            'Capacity': volume.Capacity,
-            'FreeSpace': volume.FreeSpace,
-            'Label': volume.Label or 'N/A',
-            'DriveLetter': volume.DriveLetter or 'N/A'
-        }
-    return None
+@dataclasses.dataclass
+class Partition:
+    index: int
+    size: int
+    type: str
+    drive_letter: str
+    file_system: str
+    bitlocker_status: str
+    type_guid: str
+    unique_guid: str
+    known_type: str
+    first_bytes: str
 
-def get_partition_type_gpt(disk_number, partition_number):
-    drive_handle = win32file.CreateFile(
-        f"\\\\.\\PhysicalDrive{disk_number}",
-        win32file.GENERIC_READ,
-        win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE,
-        None,
-        win32file.OPEN_EXISTING,
-        0,
-        None
-    )
 
-    try:
-        output_buffer = win32file.DeviceIoControl(
-            drive_handle,
-            winioctlcon.IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
-            None,
-            32768  # Larger buffer size to accommodate full drive layout
-        )
+@dataclasses.dataclass
+class Disk:
+    index: int
+    device_id: str
+    model: str
+    serial_number: str
+    disk_type: str
+    partitions: List[Partition]
 
-        partition_style, partition_count = struct.unpack_from("<II", output_buffer)
 
-        if partition_style != 1:  # Not GPT
-            return "Not a GPT disk", "Not a GPT disk"
+@dataclasses.dataclass
+class System:
+    disks: List[Disk]
 
-        offset = 48  # Start of partition entries
-        for i in range(partition_count):
-            if offset + 128 > len(output_buffer):
-                return f"Partition {partition_number} not found (buffer too short)", "Not found"
 
-            alignment_offset = [0, 16, 32, 48][i]
-            part_info = output_buffer[offset + alignment_offset:offset + alignment_offset + 128]
+def get_wmi_service(namespace="root\\cimv2"):
+    return win32com.client.Dispatch("WbemScripting.SWbemLocator").ConnectServer(".", namespace)
 
-            part_number, = struct.unpack_from("<I", part_info, 24)
-            if part_number == partition_number + 1:  # Adjust for 0-based index
-                type_guid = uuid.UUID(bytes_le=part_info[32:48])
-                unique_guid = uuid.UUID(bytes_le=part_info[48:64])
-                return str(type_guid).upper(), str(unique_guid).upper()
 
-            offset += 128  # Move to the next partition entry
-
-        return f"Partition {partition_number} not found", "Not found"
-
-    except win32file.error as e:
-        return f"Error: {str(e)}", "Error"
-    finally:
-        win32file.CloseHandle(drive_handle)
-
+@lru_cache(maxsize=None)
 def get_known_partition_type(guid):
     gpt_guids = {
         'e3c9e316-0b5c-4db8-817d-f92df00215ae': 'Microsoft Reserved Partition (MSR)',
@@ -113,36 +88,8 @@ def get_known_partition_type(guid):
     else:
         return gpt_guids.get(guid.lower(), 'Unknown GPT identifier')
 
-def get_partition_type_mbr(disk_number, partition_number):
-    drive_handle = win32file.CreateFile(
-        f"\\\\.\\PhysicalDrive{disk_number}",
-        win32file.GENERIC_READ,
-        win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE,
-        None,
-        win32file.OPEN_EXISTING,
-        0,
-        None
-    )
-    try:
-        error, mbr = win32file.ReadFile(drive_handle, 512)
-        if error:
-            return f"Error reading MBR: {win32api.FormatMessage(error)}"
 
-        partition_table_offset = 446
-        partition_entry_size = 16
-        partition_offset = partition_table_offset + (partition_number * partition_entry_size)
-
-        if partition_offset + partition_entry_size > len(mbr):
-            return "Invalid partition number"
-
-        partition_entry = mbr[partition_offset:partition_offset + partition_entry_size]
-        partition_type = partition_entry[4]
-
-        return f"0x{partition_type:02X}"
-    finally:
-        win32file.CloseHandle(drive_handle)
-
-def get_partition_hex_data(disk_number, partitions):
+def get_disk_type(disk_number):
     drive_handle = win32file.CreateFile(
         f"\\\\.\\PhysicalDrive{disk_number}",
         win32file.GENERIC_READ,
@@ -154,111 +101,97 @@ def get_partition_hex_data(disk_number, partitions):
     )
 
     try:
-        partition_data = {}
-        for i, partition in enumerate(partitions):
-            try:
-                start_sector = int(partition.StartingOffset) // 512
-                win32file.SetFilePointer(drive_handle, start_sector * 512, win32file.FILE_BEGIN)
-                error, data = win32file.ReadFile(drive_handle, 512)
-                if error == 0:
-                    hex_data = data.hex()
-                    partition_data[f"Partition {i + 1}"] = hex_data
-                else:
-                    partition_data[f"Partition {i + 1}"] = f"Error reading data: {win32api.FormatMessage(error)}"
-            except Exception as e:
-                partition_data[f"Partition {i + 1}"] = f"Error: {str(e)}"
+        output_buffer = win32file.DeviceIoControl(
+            drive_handle,
+            winioctlcon.IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
+            None,
+            32768
+        )
 
-        return partition_data
+        partition_style, _ = struct.unpack_from("<II", output_buffer)
 
-    finally:
-        win32file.CloseHandle(drive_handle)
-
-def get_partition_info(disk_index):
-    wmi_service = get_wmi_service()
-    partitions = []
-
-    disk_query = f"SELECT * FROM Win32_DiskDrive WHERE Index = {disk_index}"
-    disk_info = wmi_service.ExecQuery(disk_query)[0]
-    disk_model = disk_info.Model.strip() if disk_info.Model else "N/A"
-    disk_serial = disk_info.SerialNumber.strip() if disk_info.SerialNumber else "N/A"
-
-    disk_partitions = wmi_service.ExecQuery(f"SELECT * FROM Win32_DiskPartition WHERE DiskIndex = {disk_index}")
-
-    partition_hex_data = get_partition_hex_data(disk_index, disk_partitions)
-
-    for idx, partition in enumerate(disk_partitions):
-        partition_info = {
-            'PartitionID': f"Disk #{disk_index}, Partition #{partition.Index}",
-            'DiskModel': disk_model,
-            'DiskSerial': disk_serial,
-            'Size': int(partition.Size),
-            'Type': partition.Type,
-            'DriveLetter': 'N/A',
-            'FileSystem': 'N/A',
-            'BitLocker': 'N/A'
-        }
-
-        query = f"ASSOCIATORS OF {{Win32_DiskPartition.DeviceID='{partition.DeviceID}'}} WHERE AssocClass = Win32_LogicalDiskToPartition"
-        logical_disks = wmi_service.ExecQuery(query)
-
-        for logical_disk in logical_disks:
-            partition_info['DriveLetter'] = logical_disk.DeviceID
-            partition_info['FileSystem'] = logical_disk.FileSystem
-            partition_info['BitLocker'] = get_bitlocker_status(logical_disk.DeviceID)
-
-        partition_type_gpt, partition_unique_gpt = get_partition_type_gpt(disk_index, partition.Index)
-        partition_info['PartitionTypeGUID'] = partition_type_gpt
-        partition_info['PartitionUniqueGUID'] = partition_unique_gpt
-        if partition_type_gpt == "Not a GPT disk":
-            partition_type_mbr = get_partition_type_mbr(disk_index, partition.Index)
-            partition_info['PartitionTypeGUID'] = partition_type_mbr
-            partition_info['PartitionUniqueGUID'] = "N/A for MBR"
-            partition_info['KnownPartitionType'] = get_known_partition_type(partition_type_mbr)
+        if partition_style == 1:
+            return "GPT"
+        elif partition_style == 0:
+            return "MBR"
         else:
-            partition_info['KnownPartitionType'] = get_known_partition_type(partition_type_gpt)
+            return "Unknown"
 
-        partition_info['FirstBytes'] = partition_hex_data.get(f"Partition {idx + 1}", "Unable to read partition data")
-
-        partitions.append(partition_info)
-
-    return partitions
-
-
-import pyperclip
+    except win32file.error as e:
+        return f"Error: {str(e)}"
+    finally:
+        win32file.CloseHandle(drive_handle)
 
 
-def copy_partition_info_to_clipboard(partition):
-    info = [
-        f"Partition Information:",
-        f"ID: {partition['PartitionID']}",
-        f"Disk Model: {partition['DiskModel']}",
-        f"Disk Serial: {partition['DiskSerial']}",
-        f"Type: {partition['Type']}",
-        f"Drive Letter: {partition['DriveLetter']}",
-        f"Size: {partition['Size'] / (1024 ** 2):.2f} MB",
-        f"File System: {partition['FileSystem']}",
-        f"BitLocker: {partition['BitLocker']}",
-        f"Type GUID: {partition['PartitionTypeGUID']}",
-        f"Unique GUID: {partition['PartitionUniqueGUID']}",
-        f"Known Type: {partition['KnownPartitionType']}"
-    ]
-    if 'Label' in partition:
-        info.append(f"Label: {partition['Label']}")
-    if 'FirstBytes' in partition:
-        info.append("First 512 bytes:")
-        hex_data = partition['FirstBytes']
-        for i in range(0, len(hex_data), 32):
-            info.append(hex_data[i:i + 32])
+def parse_partition_data(disk_number, partition_number, disk_type):
+    drive_handle = win32file.CreateFile(
+        f"\\\\.\\PhysicalDrive{disk_number}",
+        win32file.GENERIC_READ,
+        win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE,
+        None,
+        win32file.OPEN_EXISTING,
+        0,
+        None
+    )
 
-    clipboard_content = "\n".join(info)
-    pyperclip.copy(clipboard_content)
-    return "Partition information copied to clipboard!"
+    try:
+        if disk_type == "GPT":
+            output_buffer = win32file.DeviceIoControl(
+                drive_handle,
+                winioctlcon.IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
+                None,
+                32768
+            )
+
+            _, partition_count = struct.unpack_from("<II", output_buffer)
+
+            offset = 48  # Start of partition entries
+            for i in range(partition_count):
+                if offset + 128 > len(output_buffer):
+                    return "Not found", "Not found"
+
+                alignment_offset = [0, 16, 32, 48][i]
+                part_info = output_buffer[offset + alignment_offset:offset + alignment_offset + 128]
+
+                part_number, = struct.unpack_from("<I", part_info, 24)
+                if part_number == partition_number + 1:  # Adjust for 0-based index
+                    type_guid = uuid.UUID(bytes_le=part_info[32:48])
+                    unique_guid = uuid.UUID(bytes_le=part_info[48:64])
+                    return str(type_guid).upper(), str(unique_guid).upper()
+
+                offset += 128  # Move to the next partition entry
+
+            return "Not found", "Not found"
+
+        elif disk_type == "MBR":
+            error, mbr = win32file.ReadFile(drive_handle, 512)
+            if error:
+                return f"Error reading MBR: {win32api.FormatMessage(error)}", "N/A"
+
+            partition_table_offset = 446
+            partition_entry_size = 16
+            partition_offset = partition_table_offset + (partition_number * partition_entry_size)
+
+            if partition_offset + partition_entry_size > len(mbr):
+                return "Invalid partition number", "N/A"
+
+            partition_entry = mbr[partition_offset:partition_offset + partition_entry_size]
+            partition_type = partition_entry[4]
+
+            return f"0x{partition_type:02X}", "N/A"
+
+        else:
+            return "Unknown disk type", "N/A"
+
+    except win32file.error as e:
+        return f"Error: {str(e)}", "Error"
+    finally:
+        win32file.CloseHandle(drive_handle)
 
 
 def get_bitlocker_status(drive_letter):
     try:
-        wmi_service = win32com.client.Dispatch("WbemScripting.SWbemLocator").ConnectServer(".",
-                                                                                           "root\\cimv2\\Security\\MicrosoftVolumeEncryption")
+        wmi_service = get_wmi_service("root\\cimv2\\Security\\MicrosoftVolumeEncryption")
         volumes = wmi_service.ExecQuery(f"SELECT * FROM Win32_EncryptableVolume WHERE DriveLetter = '{drive_letter}'")
 
         for volume in volumes:
@@ -294,6 +227,113 @@ def get_bitlocker_status(drive_letter):
 
     return "Unable to determine"
 
+
+def get_partition_hex_data(disk_number, partition):
+    drive_handle = win32file.CreateFile(
+        f"\\\\.\\PhysicalDrive{disk_number}",
+        win32file.GENERIC_READ,
+        win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE,
+        None,
+        win32file.OPEN_EXISTING,
+        0,
+        None
+    )
+
+    try:
+        start_sector = int(partition.StartingOffset) // 512
+        win32file.SetFilePointer(drive_handle, start_sector * 512, win32file.FILE_BEGIN)
+        error, data = win32file.ReadFile(drive_handle, 512)
+        if error == 0:
+            return data.hex()
+        else:
+            return f"Error reading data: {win32api.FormatMessage(error)}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+    finally:
+        win32file.CloseHandle(drive_handle)
+
+
+def get_volume_info(partition_device_id):
+    wmi_service = get_wmi_service()
+
+    # First, get the associated logical disk
+    query = f"ASSOCIATORS OF {{Win32_DiskPartition.DeviceID='{partition_device_id}'}} WHERE AssocClass = Win32_LogicalDiskToPartition"
+    logical_disks = wmi_service.ExecQuery(query)
+
+    for logical_disk in logical_disks:
+        # Now use the DeviceID from the logical disk to query Win32_Volume
+        volume_query = f"SELECT * FROM Win32_Volume WHERE DriveLetter = '{logical_disk.DeviceID}'"
+        volumes = wmi_service.ExecQuery(volume_query)
+
+        for volume in volumes:
+            return Volume(
+                drive_letter=volume.DriveLetter or 'N/A',
+                file_system=volume.FileSystem or 'N/A',
+                capacity=volume.Capacity,
+                free_space=volume.FreeSpace,
+                label=volume.Label or 'N/A',
+                bitlocker_status=get_bitlocker_status(volume.DriveLetter)
+            )
+
+    # If no volume is found, return a default Volume object
+    return Volume(
+        drive_letter='N/A',
+        file_system='N/A',
+        capacity=0,
+        free_space=0,
+        label='N/A',
+        bitlocker_status='N/A'
+    )
+
+
+def get_partition(disk_index, partition, disk_type):
+    type_guid, unique_guid = parse_partition_data(disk_index, partition.Index, disk_type)
+    volume = get_volume_info(partition.DeviceID)
+
+    return Partition(
+        index=partition.Index,
+        size=int(partition.Size),
+        type=partition.Type,
+        drive_letter=volume.drive_letter if volume else 'N/A',
+        file_system=volume.file_system if volume else 'N/A',
+        bitlocker_status=volume.bitlocker_status if volume else 'N/A',
+        type_guid=type_guid,
+        unique_guid=unique_guid,
+        known_type=get_known_partition_type(type_guid),
+        first_bytes=get_partition_hex_data(disk_index, partition)
+    )
+
+
+def get_partitions(disk_index, disk_type):
+    wmi_service = get_wmi_service()
+    disk_partitions = wmi_service.ExecQuery(f"SELECT * FROM Win32_DiskPartition WHERE DiskIndex = {disk_index}")
+
+    return [get_partition(disk_index, partition, disk_type) for partition in disk_partitions]
+
+
+def get_disks():
+    wmi_service = get_wmi_service()
+    disk_drives = wmi_service.ExecQuery("SELECT * FROM Win32_DiskDrive")
+
+    disks = []
+    for disk in disk_drives:
+        disk_type = get_disk_type(disk.Index)
+        disks.append(Disk(
+            index=disk.Index,
+            device_id=disk.DeviceID,
+            model=disk.Model.strip() if disk.Model else "N/A",
+            serial_number=disk.SerialNumber.strip() if disk.SerialNumber else "N/A",
+            disk_type=disk_type,
+            partitions=get_partitions(disk.Index, disk_type)
+        ))
+
+    return disks
+
+
+def get_system_info():
+    return System(disks=get_disks())
+
+
 def create_windows(stdscr, extra_rows=0):
     physical_height, width = stdscr.getmaxyx()
     total_height = physical_height + extra_rows
@@ -312,21 +352,20 @@ def create_windows(stdscr, extra_rows=0):
 
     return left_pad, right_pad, physical_height
 
-def display_drive_selection(left_pad, drives, selected_index, start_index, is_active):
+def display_drive_selection(left_pad, disks, selected_index, start_index, is_active):
     left_pad.clear()
     height, width = left_pad.getmaxyx()
     left_pad.addstr(0, 0, "Physical Drives:")
-    for idx, drive in enumerate(drives[start_index:], start=start_index):
+    for idx, disk in enumerate(disks[start_index:], start=start_index):
         if idx - start_index + 2 >= height:
             break
-        drive_info = f"PHYSICALDRIVE{drive['Index']} - {drive['Model'][:width - 20]}"
+        drive_info = f"Disk {disk.index}: {disk.model[:width - 20]}"
         if idx == selected_index and is_active:
             left_pad.attron(curses.A_REVERSE)
             left_pad.addnstr(idx - start_index + 2, 2, drive_info, width - 3)
             left_pad.attroff(curses.A_REVERSE)
         else:
             left_pad.addnstr(idx - start_index + 2, 2, drive_info, width - 3)
-
 
 def display_partition_info(right_pad, partitions, current_partition, scroll_position, is_active):
     right_pad.clear()
@@ -339,36 +378,55 @@ def display_partition_info(right_pad, partitions, current_partition, scroll_posi
 
     part = partitions[current_partition]
     lines = [
-        f"ID: {part['PartitionID']}",
-        f"Disk Model: {part['DiskModel']}",
-        f"Disk Serial: {part['DiskSerial']}",
-        f"Type: {part['Type']}",
-        f"Drive Letter: {part['DriveLetter']}",
-        f"Size: {part['Size'] / (1024 ** 2):.2f} MB",
-        f"FS: {part['FileSystem']}",
-        f"BitLocker: {part['BitLocker']}",
-        f"Type GUID: {part['PartitionTypeGUID']}",
-        f"Unique GUID: {part['PartitionUniqueGUID']}",
-        f"Known Type: {part['KnownPartitionType']}"
+        f"Index: {part.index}",
+        f"Size: {part.size / (1024**3):.2f} GB",
+        f"Type: {part.type}",
+        f"Drive Letter: {part.drive_letter}",
+        f"File System: {part.file_system}",
+        f"BitLocker Status: {part.bitlocker_status}",
+        f"Type GUID: {part.type_guid}",
+        f"Unique GUID: {part.unique_guid}",
+        f"Known Type: {part.known_type}",
+        "First 512 bytes:",
+        part.first_bytes[:64],
+        part.first_bytes[64:128],
+        part.first_bytes[128:192],
+        part.first_bytes[192:256]
     ]
-    if 'Label' in part:
-        lines.append(f"Label: {part['Label']}")
-    if 'FirstBytes' in part:
-        lines.append("First 512 bytes:")
-        hex_data = part['FirstBytes']
-        for i in range(0, len(hex_data), 32):
-            lines.append(hex_data[i:i + 32])
 
     for idx, line in enumerate(lines[scroll_position:], start=2):
         if idx >= height:
             break
-        if idx == 2 and is_active:  # Highlight the first line of partition info when active
+        if idx == 2 and is_active:
             right_pad.attron(curses.A_REVERSE)
             right_pad.addnstr(idx, 2, line, width - 3)
             right_pad.attroff(curses.A_REVERSE)
         else:
             right_pad.addnstr(idx, 2, line, width - 3)
 
+
+def copy_partition_info_to_clipboard(partition):
+    info = [
+        f"Partition Information:",
+        f"Index: {partition.index}",
+        f"Size: {partition.size / (1024**3):.2f} GB",
+        f"Type: {partition.type}",
+        f"Drive Letter: {partition.drive_letter}",
+        f"File System: {partition.file_system}",
+        f"BitLocker Status: {partition.bitlocker_status}",
+        f"Type GUID: {partition.type_guid}",
+        f"Unique GUID: {partition.unique_guid}",
+        f"Known Type: {partition.known_type}",
+        f"First 512 bytes:",
+        partition.first_bytes[:64],
+        partition.first_bytes[64:128],
+        partition.first_bytes[128:192],
+        partition.first_bytes[192:256]
+    ]
+
+    clipboard_content = "\n".join(info)
+    pyperclip.copy(clipboard_content)
+    return "Partition information copied to clipboard!"
 
 def main(stdscr):
     curses.curs_set(0)  # Hide the cursor
@@ -378,7 +436,7 @@ def main(stdscr):
     extra_rows = 100  # Adjust this value to increase the number of rows
     left_pad, right_pad, physical_height = create_windows(stdscr, extra_rows)
 
-    physical_drives = get_physical_drives()
+    system = get_system_info()
     current_drive_selection = 0
     current_partition = 0
     left_scroll = 0
@@ -387,14 +445,14 @@ def main(stdscr):
     status_message = ""
 
     while True:
-        selected_drive = physical_drives[current_drive_selection]
-        partitions = get_partition_info(selected_drive['Index'])
+        selected_disk = system.disks[current_drive_selection]
+        partitions = selected_disk.partitions
 
         # Ensure current_partition is within valid range
         if current_partition >= len(partitions):
             current_partition = max(0, len(partitions) - 1)
 
-        display_drive_selection(left_pad, physical_drives, current_drive_selection, left_scroll, active_pane == 'left')
+        display_drive_selection(left_pad, system.disks, current_drive_selection, left_scroll, active_pane == 'left')
         display_partition_info(right_pad, partitions, current_partition, right_scroll, active_pane == 'right')
 
         # Display status message
@@ -411,9 +469,8 @@ def main(stdscr):
         max_right_scroll = max(0, right_height - screen_height)
 
         # Refresh the visible portion of the pads
-        left_pad.refresh(left_scroll, 0, 0, 0, screen_height - 1, left_width - 1)
-        right_pad.refresh(right_scroll, 0, 0, left_width + 1, screen_height - 1, screen_width - 1)
-
+        left_pad.refresh(left_scroll, 0, 0, 0, screen_height - 2, left_width - 1)
+        right_pad.refresh(right_scroll, 0, 0, left_width + 1, screen_height - 2, screen_width - 1)
 
         key = stdscr.getch()
         if key == ord('q'):
@@ -434,7 +491,7 @@ def main(stdscr):
                 right_scroll = max(0, right_scroll - 1)
         elif key == curses.KEY_DOWN:
             if active_pane == 'left':
-                if current_drive_selection < len(physical_drives) - 1:
+                if current_drive_selection < len(system.disks) - 1:
                     current_drive_selection += 1
                     current_partition = 0  # Reset partition selection when changing drives
                     right_scroll = 0
@@ -450,10 +507,6 @@ def main(stdscr):
                 right_scroll = 0
 
         stdscr.refresh()
-
-
-if __name__ == "__main__":
-    curses.wrapper(main)
 
 if __name__ == "__main__":
     curses.wrapper(main)
