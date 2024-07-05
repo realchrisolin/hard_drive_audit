@@ -367,18 +367,24 @@ def display_drive_selection(left_pad, disks, selected_index, start_index, is_act
         else:
             left_pad.addnstr(idx - start_index + 2, 2, drive_info, width - 3)
 
-def display_partition_info(right_pad, partitions, current_partition, scroll_position, is_active):
+def display_partition_info(right_pad, disk, partitions, current_partition, scroll_position, is_active):
     right_pad.clear()
     height, width = right_pad.getmaxyx()
-    right_pad.addstr(0, 0, f"Partition Information (Total: {len(partitions)}, Current: {current_partition + 1}):")
+    right_pad.addstr(0, 0, f"Disk and Partition Information (Partitions: {len(partitions)}, Current: {current_partition + 1}):")
 
     if not partitions:
         right_pad.addstr(2, 2, "No partitions found")
         return
 
+    disk_info = [
+        f"Disk Model: {disk.model}",
+        f"Disk Serial: {disk.serial_number}",
+        f"Disk Type: {disk.disk_type}"
+    ]
+
     part = partitions[current_partition]
-    lines = [
-        f"Index: {part.index}",
+    partition_info = [
+        f"Partition Index: {part.index}",
         f"Size: {part.size / (1024**3):.2f} GB",
         f"Type: {part.type}",
         f"Drive Letter: {part.drive_letter}",
@@ -394,6 +400,8 @@ def display_partition_info(right_pad, partitions, current_partition, scroll_posi
         part.first_bytes[192:256]
     ]
 
+    lines = disk_info + [""] + partition_info
+
     for idx, line in enumerate(lines[scroll_position:], start=2):
         if idx >= height:
             break
@@ -405,8 +413,13 @@ def display_partition_info(right_pad, partitions, current_partition, scroll_posi
             right_pad.addnstr(idx, 2, line, width - 3)
 
 
-def copy_partition_info_to_clipboard(partition):
+def copy_partition_info_to_clipboard(disk, partition):
     info = [
+        f"Disk Information:",
+        f"Model: {disk.model}",
+        f"Serial Number: {disk.serial_number}",
+        f"Disk Type: {disk.disk_type}",
+        f"",
         f"Partition Information:",
         f"Index: {partition.index}",
         f"Size: {partition.size / (1024**3):.2f} GB",
@@ -426,7 +439,8 @@ def copy_partition_info_to_clipboard(partition):
 
     clipboard_content = "\n".join(info)
     pyperclip.copy(clipboard_content)
-    return "Partition information copied to clipboard!"
+    return "Disk and partition information copied to clipboard!"
+
 
 def main(stdscr):
     curses.curs_set(0)  # Hide the cursor
@@ -453,7 +467,7 @@ def main(stdscr):
             current_partition = max(0, len(partitions) - 1)
 
         display_drive_selection(left_pad, system.disks, current_drive_selection, left_scroll, active_pane == 'left')
-        display_partition_info(right_pad, partitions, current_partition, right_scroll, active_pane == 'right')
+        display_partition_info(right_pad, selected_disk, partitions, current_partition, right_scroll, active_pane == 'right')
 
         # Display status message
         stdscr.addstr(physical_height - 1, 0, status_message[:physical_height - 1].ljust(physical_height - 1))
@@ -479,7 +493,7 @@ def main(stdscr):
             active_pane = 'right' if active_pane == 'left' else 'left'
         elif key == ord('c'):  # 'c' key to copy partition info
             if partitions:
-                status_message = copy_partition_info_to_clipboard(partitions[current_partition])
+                status_message = copy_partition_info_to_clipboard(selected_disk, partitions[current_partition])
         elif key == curses.KEY_UP:
             if active_pane == 'left':
                 if current_drive_selection > 0:
